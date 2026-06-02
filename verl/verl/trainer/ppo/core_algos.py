@@ -318,7 +318,6 @@ def compute_policy_loss_real(old_log_prob, log_prob, advantages, eos_mask, uid, 
 
     global_scores = (log_ratio_token * global_eos_mask).sum(dim=1) / global_eos_mask.sum(dim=1)
 
-    # Aggregate token-level advantages into sequence-level advantages.
     global_seq_advantages = (global_advantages * global_eos_mask).sum(dim=1) / global_eos_mask.sum(dim=1)
 
     sorted_uid, indices = global_uid.sort()
@@ -333,18 +332,12 @@ def compute_policy_loss_real(old_log_prob, log_prob, advantages, eos_mask, uid, 
     grouped_rewards = sorted_rewards.view(num_questions, num_responses_per_question)
     grouped_seq_advantages = sorted_seq_advantages.view(num_questions, num_responses_per_question)
 
-    # Use the sign of the sequence-level advantage to define positive / negative samples.
     pos_mask = (grouped_seq_advantages > 0)
     neg_mask = (grouped_seq_advantages < 0)
+    degenerate = ((pos_mask.sum(dim=1) == 0) & (neg_mask.sum(dim=1) == 0)).unsqueeze(1)
+    pos_mask = pos_mask | (degenerate & (grouped_rewards > 0))
+    neg_mask = neg_mask | (degenerate & (grouped_rewards <= 0))
 
-    # No group-level filtering: every group contributes, matching the REAL objective
-    # (Eq. 5), which does not require a group to contain BOTH positives and negatives.
-    # The fixed anchor logit at 0 (the appended `zeros` column) keeps each term
-    # well-defined when a group has only positives or only negatives, so such
-    # single-sided groups now yield a meaningful, non-zero gradient instead of being
-    # dropped. (Note: groups whose rollouts all share the same reward have A==0 for
-    # every rollout, i.e. neither positive nor negative, so they still contribute a
-    # zero gradient under this advantage-sign labeling.)
     scaled_scores = grouped_scores / tau
     zeros = torch.zeros(grouped_scores.size(0), 1, device=grouped_scores.device, dtype=grouped_scores.dtype)
 

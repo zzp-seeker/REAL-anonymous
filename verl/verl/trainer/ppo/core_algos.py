@@ -293,20 +293,33 @@ def compute_policy_loss_gspo(old_log_prob, log_prob, advantages, eos_mask, clipr
 
 
 def compute_policy_loss_real(old_log_prob, log_prob, advantages, eos_mask, uid, seq_level_rewards, delta, tau, kl_type='low_var_kl'):
+    """
+    Log-Ratio + Circle Loss + Vanilla KL.
+
+    Positive / negative samples within each group are determined by the sign of
+    the (sequence-level) advantage rather than by the raw binary reward:
+        * advantage > 0  -> positive sample
+        * advantage < 0  -> negative sample
+        * advantage == 0 -> neither positive nor negative
+    This supports non-binary / shaped rewards while keeping the group-wise
+    classification formulation unchanged.
+    """
     if torch.distributed.is_initialized():
         global_old_log_prob = torch.cat(torch.distributed.nn.all_gather(old_log_prob), dim=0)
         global_log_prob = torch.cat(torch.distributed.nn.all_gather(log_prob), dim=0)
         global_eos_mask = torch.cat(torch.distributed.nn.all_gather(eos_mask), dim=0)
         global_uid = torch.cat(torch.distributed.nn.all_gather(uid), dim=0)
         global_rewards = torch.cat(torch.distributed.nn.all_gather(seq_level_rewards), dim=0)
+        global_advantages = torch.cat(torch.distributed.nn.all_gather(advantages), dim=0)
     else:
         global_old_log_prob = old_log_prob
         global_log_prob = log_prob
         global_eos_mask = eos_mask
         global_uid = uid
         global_rewards = seq_level_rewards
+        global_advantages = advantages
 
-    log_ratio_token = global_log_prob - global_old_log_prob 
+    log_ratio_token = global_log_prob - global_old_log_prob
     ratio = torch.exp(log_ratio_token)
 
     if kl_type == 'low_var_kl':
@@ -315,18 +328,25 @@ def compute_policy_loss_real(old_log_prob, log_prob, advantages, eos_mask, uid, 
         ppo_kl = verl_F.masked_mean(-log_ratio_token, global_eos_mask)
 
     global_scores = (log_ratio_token * global_eos_mask).sum(dim=1) / global_eos_mask.sum(dim=1)
+
+    # Aggregate token-level advantages into sequence-level advantages.
+    global_seq_advantages = (global_advantages * global_eos_mask).sum(dim=1) / global_eos_mask.sum(dim=1)
+
     sorted_uid, indices = global_uid.sort()
     sorted_scores = global_scores[indices]
     sorted_rewards = global_rewards[indices]
+    sorted_seq_advantages = global_seq_advantages[indices]
 
     num_questions = global_uid.unique().numel()
     num_responses_per_question = global_uid.size(0) // num_questions
-    
+
     grouped_scores = sorted_scores.view(num_questions, num_responses_per_question)
     grouped_rewards = sorted_rewards.view(num_questions, num_responses_per_question)
+    grouped_seq_advantages = sorted_seq_advantages.view(num_questions, num_responses_per_question)
 
-    pos_mask = (grouped_rewards == 1)
-    neg_mask = (grouped_rewards == 0)
+    # Use the sign of the sequence-level advantage to define positive / negative samples.
+    pos_mask = (grouped_seq_advantages > 0)
+    neg_mask = (grouped_seq_advantages < 0)
     valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
 
     if valid_mask.sum() > 0:

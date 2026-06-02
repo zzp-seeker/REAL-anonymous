@@ -336,30 +336,29 @@ def compute_policy_loss_real(old_log_prob, log_prob, advantages, eos_mask, uid, 
     # Use the sign of the sequence-level advantage to define positive / negative samples.
     pos_mask = (grouped_seq_advantages > 0)
     neg_mask = (grouped_seq_advantages < 0)
-    valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
 
-    if valid_mask.sum() > 0:
-        batch_scores = grouped_scores[valid_mask]   # (N_valid, R)
-        batch_pos_mask = pos_mask[valid_mask]
-        batch_neg_mask = neg_mask[valid_mask]
+    # No group-level filtering: every group contributes, matching the REAL objective
+    # (Eq. 5), which does not require a group to contain BOTH positives and negatives.
+    # The fixed anchor logit at 0 (the appended `zeros` column) keeps each term
+    # well-defined when a group has only positives or only negatives, so such
+    # single-sided groups now yield a meaningful, non-zero gradient instead of being
+    # dropped. (Note: groups whose rollouts all share the same reward have A==0 for
+    # every rollout, i.e. neither positive nor negative, so they still contribute a
+    # zero gradient under this advantage-sign labeling.)
+    scaled_scores = grouped_scores / tau
+    zeros = torch.zeros(grouped_scores.size(0), 1, device=grouped_scores.device, dtype=grouped_scores.dtype)
 
-        scaled_scores = batch_scores / tau
-        zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
+    # A. Negative Loss: log(1 + sum(e^{S_neg}))
+    neg_input = scaled_scores.masked_fill(~neg_mask, float('-inf'))
+    neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
 
-        # A. Negative Loss: log(1 + sum(e^{S_neg}))
-        neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
-        neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
+    # B. Positive Loss: log(1 + sum(e^{-S_pos}))
+    pos_input = -scaled_scores
+    pos_input = pos_input.masked_fill(~pos_mask, float('-inf'))
+    pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
 
-        # B. Positive Loss: log(1 + sum(e^{-S_pos}))
-        pos_input = -scaled_scores
-        pos_input = pos_input.masked_fill(~batch_pos_mask, float('-inf'))
-        pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
-
-        per_question_loss = neg_loss + pos_loss
-        pg_loss = per_question_loss.sum() / num_questions
-
-    else:
-        pg_loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
+    per_question_loss = neg_loss + pos_loss
+    pg_loss = per_question_loss.sum() / num_questions
 
     final_loss = pg_loss
     pg_clipfrac = torch.gt(ppo_kl, delta).float()

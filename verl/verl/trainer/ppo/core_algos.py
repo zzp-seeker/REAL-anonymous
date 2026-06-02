@@ -293,17 +293,6 @@ def compute_policy_loss_gspo(old_log_prob, log_prob, advantages, eos_mask, clipr
 
 
 def compute_policy_loss_real(old_log_prob, log_prob, advantages, eos_mask, uid, seq_level_rewards, delta, tau, kl_type='low_var_kl'):
-    """
-    Log-Ratio + Circle Loss + Vanilla KL.
-
-    Positive / negative samples within each group are determined by the sign of
-    the (sequence-level) advantage rather than by the raw binary reward:
-        * advantage > 0  -> positive sample
-        * advantage < 0  -> negative sample
-        * advantage == 0 -> neither positive nor negative
-    This supports non-binary / shaped rewards while keeping the group-wise
-    classification formulation unchanged.
-    """
     if torch.distributed.is_initialized():
         global_old_log_prob = torch.cat(torch.distributed.nn.all_gather(old_log_prob), dim=0)
         global_log_prob = torch.cat(torch.distributed.nn.all_gather(log_prob), dim=0)
